@@ -8,28 +8,36 @@ component accessors="true" {
     property name="credentialsJSON";
     property name="tokenEndpoint" type="string" default="";
     property name="notificationsEndpoint" type="string" default="";
-    property name="accessToken" type="string" default="";
+    property name="accessToken" type="struct" default="";
+
+    property name="expiryTime" type="numeric" default="";
+    property name="accessTokenValidity" type="numeric" default="" hint="How long should the AccessToken be valid (in minutes)";
 
     /**
     * Constructor Method
-    * 
+    *
     * @filePath The file path to the credentials JSON file
     * @tokenEndpoint The endpoint to call when making the access token request.
     */
     public function init(
         required string filePath,
         required string tokenEndpoint = 'https://www.googleapis.com/oauth2/v4/token',
-        required string notificationsEndpoint = 'https://indexing.googleapis.com/v3/urlNotifications'
+        required string notificationsEndpoint = 'https://indexing.googleapis.com/v3/urlNotifications',
+        required numeric accessTokenValidity = '60'
     ){
         loadCredentialsFile( arguments.filePath );
         setTokenEndpoint( arguments.tokenEndpoint );
         setNotificationsEndpoint( arguments.notificationsEndpoint );
+
+        setExpiryTime( getEpoch(type="current") - 1 ); // if we init the component, the isAccessTokenExpired() should be true
+        setAccessTokenValidity( arguments.accessTokenValidity );
+
         return this;
     }
 
     /**
     * Add / Update a URL
-    * 
+    *
     * @url The fully-qualified location of the item that you want to update
     */
     public struct function updateURL( required string url ){
@@ -41,7 +49,7 @@ component accessors="true" {
 
     /**
     * Remove a URL
-    * 
+    *
     * @url The fully-qualified location of the item that you want to remove
     */
     public struct function removeURL( required string url ){
@@ -66,17 +74,32 @@ component accessors="true" {
     }
 
     /**
-    * Makes a call to the auth server to return the access token
+    *
     */
     public struct function getAccessToken(){
+
+        if ( ! isTokenExpired() ) {
+            return variables.AccessToken;
+        }
+
+        return refreshAccessToken();
+    }
+
+    /**
+    * Makes a call to the auth server to return the access token
+    */
+    public struct function refreshAccessToken(){
         var JWTPayload = buildJWT();
         var result = '';
         cfhttp( url=getTokenEndpoint(), method='POST', result='result' ){
             cfhttpparam( type='formfield', name='grant_type', value='urn:ietf:params:oauth:grant-type:jwt-bearer' );
             cfhttpparam( type='formfield', name='assertion', value=JWTPayload );
         }
+
         var stuResponse = deserializeJSON( result[ 'fileContent' ] );
-        setAccessToken( stuResponse.access_token ?: '' );
+        setAccessToken( stuResponse );
+        setExpiryTime ( getEpoch(type="expiry") );
+
         return stuResponse;
     }
 
@@ -94,7 +117,7 @@ component accessors="true" {
 
     /**
     * Makes a request to the API to perform an action
-    * 
+    *
     * @url The fully-qualified location of the item that you want to update or remove
     * @type The type of notification that you submitted
     */
@@ -121,32 +144,49 @@ component accessors="true" {
             }
         }
 
+        //  TODO: error-Handling
+
         return deserializeJSON( result[ 'fileContent' ] );
     }
+
+
+    /**
+    *
+    */
+    private boolean function isTokenExpired(){
+        return getEpoch(type="current") GT getExpiryTime();
+    }
+
+
+    /**
+    * @type "current" - means now() | "expiry" means now() + getAccessTokenValidity()
+    */
+    private numeric function getEpoch(string type="current"){
+        var dtGMT         = dateAdd( 's', getTimeZoneInfo().UTCTotalOffset, now() );
+
+        return ( arguments.type == 'expiry' ) ? generateEpochTime(  dateAdd( 'n', getAccessTokenValidity(), dtGMT) ) : generateEpochTime( dtGMT )  ;
+    }
+
 
     /**
     * Builds the JWT needed for access token requests
     */
     private string function buildJWT(){
-        var currDateTime  = now();
-        var dtGMT         = dateAdd( 's', getTimeZoneInfo().UTCTotalOffset, currDateTime );
-        var assertionTime = dateAdd( 's', 600, dtGMT );
-        var expiryTime    = dateAdd( 'n', 60, assertionTime );
         var credJSON      = getCredentialsJSON();
-        
+
         var payload       = {
             'iss'  : credJSON[ 'client_email' ],
             'scope': 'https://www.googleapis.com/auth/indexing',
             'aud'  : getTokenEndpoint(),
-            'exp'  : generateEpochTime( expiryTime ),
-            'iat'  : generateEpochTime( assertionTime )
+            'exp'  : getEpoch(type="expiry"),
+            'iat'  : getEpoch(type="current")
         };
         return encode( payload = payload );
     }
 
     /**
     * Loads the credentials file and stores the CFML representation into the component
-    * 
+    *
     * @filePath The file path to the .json file
     */
     private function loadCredentialsFile( required string filePath ){
@@ -160,7 +200,7 @@ component accessors="true" {
 
     /**
     * Returns a signed version of the provided partial JWT string
-    * 
+    *
     * @input The incomplete JWT to be signed
     */
     private function signSHA256RSA( required string input ){
@@ -186,7 +226,7 @@ component accessors="true" {
 	}
 
 	/**
-	* Restore base64 characters from an url escaped string 
+	* Restore base64 characters from an url escaped string
 	* @value The string to manipulate
 	*/
 	private function base64UrlUnescape( required string value ){
@@ -202,7 +242,7 @@ component accessors="true" {
 	private function base64UrlDecode( required string value ){
 		return toString( toBinary( base64UrlUnescape( arguments.value ) ) );
     }
-    
+
     /**
 	* Converts epoch datetime to local date
 	* @epoch Seconds from Jan 1, 1970
@@ -213,15 +253,16 @@ component accessors="true" {
 
     /**
     * Generates an epoch datetime value from the given datetime string / timestamp
-    * 
+    *
     * @datetime The datetime value to convert into an epoch
     */
     private string function generateEpochTime( required string datetime ){
         var startDate = createdatetime( '1970','01','01','00','00','00' );
-        var givenDateTime = dateConvert( 'local2utc', arguments.datetime );
-        return dateDiff( 's', startDate, givenDateTime );
+        //var givenDateTime = dateConvert( 'local2utc', arguments.datetime );
+
+        return dateDiff( 's', startDate, arguments.datetime );
     }
-    
+
     /**
     * Strips the comments and breaks from the private key
     */
@@ -254,7 +295,7 @@ component accessors="true" {
 
     /**
     * Helper method to append the struct data to the segment list when building the JWT
-    * 
+    *
     * @list The list to append the data
     * @data The data to be added to the list
     */
